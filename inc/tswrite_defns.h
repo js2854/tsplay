@@ -42,6 +42,8 @@
 #else
 typedef int SOCKET;    // for compatibility with Windows
 #include <termios.h>   // for struct termios
+#include <netinet/in.h>  // for sockaddr_in
+
 #endif
 
 
@@ -231,6 +233,7 @@ struct TS_writer
 {
   enum  TS_writer_type   how;    // what type of output we want
   union TS_writer_output where;  // where it's going to
+  struct sockaddr_in     dest;     // dest ip addr
   buffered_TS_output_p   writer; // our buffered output interface, if needed
   int                    count;  // a count of how many TS packets written
 

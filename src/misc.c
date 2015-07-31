@@ -1352,6 +1352,8 @@ extern int connect_socket(char *hostname,
     }
   }
 
+  if (!use_tcpip) return output; // udp do not connect
+
   result = connect(output,(struct sockaddr*)&ipaddr,sizeof(ipaddr));
 #ifdef _WIN32
   if (result == SOCKET_ERROR)

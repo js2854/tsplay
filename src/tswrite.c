@@ -1420,6 +1420,79 @@ static int write_tcp_data(TS_writer_p  tswriter,
   }
   return 0;
 }
+
+/*
+ * Write data out to a socket using TCP/IP (and maybe reading commands as well)
+ *
+ * - `tswriter` is the TS output context returned by `tswrite_open`
+ * - `data` is the data to write out
+ * - `data_len` is how much of it there is. If this is 0, then we will
+ *   not write any data (or, if command input is enabled, wait for permission
+ *   to write data).
+ *
+ * Returns 0 if all went well, 1 if something went wrong.
+ */
+static int write_udp_data(TS_writer_p  tswriter,
+                          byte         data[],
+                          int          data_len)
+{
+#ifdef _WIN32
+  int      written = 0;
+  int      left    = data_len;
+#else  // _WIN32
+  ssize_t  written = 0;
+  ssize_t  left    = data_len;
+#endif // _WIN32
+  int     start   = 0;
+
+  // (When writing to a file, we don't expect to ever write less than
+  // the requested number of bytes. However, if `output` is a socket,
+  // it is possible that the underlying buffering might cause a
+  // partial write.)
+  errno = 0;
+  while (left > 0)
+  {
+    written = sendto(tswriter->where.socket,&(data[start]),left,0,&(tswriter->dest),sizeof(tswriter->dest));
+#ifdef _WIN32
+    if (written == SOCKET_ERROR)
+    {
+      int err = WSAGetLastError();
+      if (err == WSAENOBUFS)
+      {
+        fprintf(stderr,"!!! Warning: 'no buffer space available' writing out"
+                " TS packet data - retrying\n");
+      }
+      else
+      {
+        fprintf(stderr,"### Error writing out TS packet data:");
+        print_winsock_err(err);
+        fprintf(stderr,"\n");
+        return 1;
+      }
+    }
+#else // _WIN32
+    if (written == -1)
+    {
+      if (errno == ENOBUFS)
+      {
+        fprintf(stderr,"!!! Warning: 'no buffer space available' writing out"
+                " TS packet data - retrying\n");
+        errno = 0;
+      }
+      else
+      {
+        fprintf(stderr,"### Error writing out TS packet data: %s\n",
+                strerror(errno));
+        return 1;
+      }
+    }
+#endif // _WIN32
+    left -= written;
+    start += written;
+  }
+  return 0;
+}
+
 
 /*
  * Wait for a new command after 'p'ausing.
@@ -1471,15 +1544,14 @@ extern int wait_for_command(TS_writer_p  tswriter)
 /*
  * Write the next data item in our buffer
  *
- * - `output` is a socket for our output
- * - `circular` is our circular buffer of "packets"
+ * - `tswriter` is the context to use for writing TS output
  *
  * Returns 0 if all went well, 1 if something went wrong.
  */
-static int write_circular_data(SOCKET             output,
-                               circular_buffer_p  circular)
+static int write_circular_data(TS_writer_p  tswriter)
 {
   int     err;
+  circular_buffer_p  circular = tswriter->writer->buffer;
   byte   *buffer  = circular->item_data + circular->start*circular->item_size;
   int     length  = circular->item[circular->start].length;
 #if DISPLAY_BUFFER
@@ -1488,7 +1560,7 @@ static int write_circular_data(SOCKET             output,
   int  newend,newstart;
 #endif
 
-  err = write_socket_data(output,buffer,length);
+  err = write_udp_data(tswriter,buffer,length);
   if (err)
   {
     // If we're writing out over UDP, it's possible our write fails for
@@ -1603,21 +1675,18 @@ static int32_t perturb_time_by(void)
 /*
  * Write the next data item in our buffer
  *
- * - `output` is a socket for our output
- * - `circular` is our circular buffer of "packets"
- * - if `quiet` then don't output extra messages (about filling up
- *   circular buffer)
+ * - `tswriter` is the context to use for writing TS output
  * - `had_eof` is set TRUE if we read a packet flagged to indicate
  *   that it is the end of data - this is how we know when to stop.
  *
  * Returns 0 if all went well, 1 if something went wrong.
  */
-static int write_from_circular(SOCKET             output,
-                               circular_buffer_p  circular,
-                               int                quiet,
+static int write_from_circular(TS_writer_p  tswriter,
                                int               *had_eof)
 {
-  int  err;
+  int  err; 
+  circular_buffer_p  circular = tswriter->writer->buffer;
+  int                quiet = tswriter->quiet;
 
   // Are we starting up for the first time?
   static int starting = TRUE;
@@ -1804,7 +1873,7 @@ static int write_from_circular(SOCKET             output,
   }
   
   // Write it...
-  err = write_circular_data(output,circular);
+  err = write_circular_data(tswriter);
   if (err) return 1;
 
   // Don't forget to update our memory before we finish
@@ -1839,10 +1908,7 @@ static int tswrite_child_process(TS_writer_p  tswriter)
   int had_eof = FALSE;
   for (;;)
   {
-    int err = write_from_circular(tswriter->where.socket,
-                                  tswriter->writer->buffer,
-                                  tswriter->quiet,
-                                  &had_eof);
+    int err = write_from_circular(tswriter,&had_eof);
     if (err) return 1;
     if (had_eof) break;
   }
@@ -2059,25 +2125,24 @@ extern int tswrite_open(TS_WRITER_TYPE  how,
     }
     if (!quiet) printf("Writing    to %s via TCP/IP\n",name);
    break;
-  case TS_W_UDP:
-    if (!quiet)
-    {
-      // We don't *know* at this stage if the `name` *is* a multicast address,
-      // but we'll assume the user only specifies `multicast_if` is it is, for
-      // the purposes of these messages (amending `connect_socket`, which does
-      // know, to output this message iff `!quiet` is a bit overkill)
-      printf("Connecting to %s via UDP on port %d",name,port);
-      if (multicast_if)
-        printf(" (multicast interface %s)",multicast_if);
-      printf("\n");
-    }
+  case TS_W_UDP: 
+    // record ip and port
+    new->dest.sin_family = AF_INET;
+    new->dest.sin_port = htons(port);
+    new->dest.sin_addr.s_addr = inet_addr(name);;
     new->where.socket = connect_socket(name,port,FALSE,multicast_if);
     if (new->where.socket == -1)
     {
       fprintf(stderr,"### Unable to connect to %s\n",name);
       return 1;
     }
-    if (!quiet) printf("Writing    to %s via UDP\n",name);
+    if (!quiet)
+    {
+        printf("Writing to %s via UDPon port %d",name,port);
+        if (multicast_if)
+            printf(" (multicast interface %s)",multicast_if);
+        printf("\n");
+    }
     break;
   default:
     fprintf(stderr,"### Unexpected writer type %d to tswrite_open()\n",how);
@@ -2648,7 +2713,7 @@ extern int tswrite_write(TS_writer_p  tswriter,
       if (err) return err;  // important, because it might be 0, 1 or EOF
       break;
     case TS_W_UDP:
-      err = write_socket_data(tswriter->where.socket,packet,TS_PACKET_SIZE);
+      err = write_udp_data(tswriter,packet,TS_PACKET_SIZE);
       if (err) return 1;
       break;
     default:
