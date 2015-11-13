@@ -1693,7 +1693,7 @@ extern int read_next_TS_packet_from_buffer(TS_reader_p  tsreader,
     else
     {
       err = fill_TS_packet_buffer(tsreader);
-      if (err == EOF)
+      if (err == EOF && TS_buffer_len > 0)
       {
         // An EOF means we read the end-of-file before finding the next
         // TS packet with a PCR. We could stop here (returning EOF), but
