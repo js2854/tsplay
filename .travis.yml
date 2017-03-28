@@ -1,4 +1,3 @@
 language: c++
-install: make get-deps
 compiler: g++
 script: make
